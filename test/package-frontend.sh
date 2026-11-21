@@ -1,67 +1,35 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
-
-repo_root=$(cd "$(dirname "$0")/.." && pwd)
-test_root=$(mktemp -d)
-created_appspec=false
-created_hooks=false
-cleanup() {
-  rm -rf "$test_root"
-  if [[ "$created_appspec" == true ]]; then rm -f "$repo_root/appspec.yml"; fi
-  if [[ "$created_hooks" == true ]]; then rm -rf "$repo_root/deploy/codedeploy"; fi
-}
-trap cleanup EXIT
-
-if [[ ! -f "$repo_root/appspec.yml" ]]; then
-  printf 'version: 0.0\nos: linux\nfiles: []\n' > "$repo_root/appspec.yml"
-  created_appspec=true
-fi
-if [[ ! -d "$repo_root/deploy/codedeploy" ]]; then
-  mkdir -p "$repo_root/deploy/codedeploy"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$repo_root/deploy/codedeploy/test-hook.sh"
-  chmod +x "$repo_root/deploy/codedeploy/test-hook.sh"
-  created_hooks=true
-fi
-
-mkdir -p "$repo_root/dist/assets"
-printf '<!doctype html>\n' > "$repo_root/dist/index.html"
-printf 'asset\n' > "$repo_root/dist/assets/app.js"
-sha=abcdef0123456789abcdef0123456789abcdef01
-bundle="$test_root/mailhub-frontend-$sha.zip"
-"$repo_root/deploy/package-frontend.sh" "$sha" "$bundle" >/dev/null
-
-unzip -Z1 "$bundle" | sort > "$test_root/bundle-contents"
-for required in appspec.yml deploy/release.sh revision.txt frontend.tar.gz frontend.tar.gz.sha256; do
-  grep -Fx "$required" "$test_root/bundle-contents" >/dev/null || {
-    printf 'FAIL: bundle is missing %s\n' "$required" >&2
-    exit 1
-  }
-done
-grep -Eq '^deploy/codedeploy/' "$test_root/bundle-contents" || {
-  printf 'FAIL: bundle is missing CodeDeploy hooks\n' >&2
-  exit 1
-}
-unzip -p "$bundle" revision.txt | grep -Fx "$sha" >/dev/null
-unzip -p "$bundle" frontend.tar.gz > "$test_root/frontend.tar.gz"
-unzip -p "$bundle" frontend.tar.gz.sha256 > "$test_root/frontend.tar.gz.sha256"
-(
-  cd "$test_root"
-  sha256sum --check frontend.tar.gz.sha256
-)
-if tar -tzf "$test_root/frontend.tar.gz" | grep -Eq '(^|/)dist/'; then
-  printf 'FAIL: frontend archive must contain flat dist contents\n' >&2
-  exit 1
-fi
-tar -tzf "$test_root/frontend.tar.gz" | grep -Eq '(^|\./)index.html$'
-tar -tzf "$test_root/frontend.tar.gz" | grep -Eq '(^|\./)assets/app.js$'
-
-if "$repo_root/deploy/package-frontend.sh" ABCDEF0123456789ABCDEF0123456789ABCDEF01 "$test_root/invalid.zip" >/dev/null 2>&1; then
-  printf 'FAIL: package script accepted an uppercase SHA\n' >&2
-  exit 1
-fi
-if grep -Eqi '(ssh|scp|EC2_SECURITY_GROUP|authorize-security-group-ingress|revoke-security-group-ingress)' "$repo_root/.github/workflows/deploy.yml"; then
-  printf 'FAIL: CodeDeploy workflow must not contain SSH or ingress controls\n' >&2
-  exit 1
-fi
-
-printf 'PASS: CodeDeploy revision has required root files, a verified flat frontend archive, and no SSH ingress workflow\n'
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd); temp=$(mktemp -d); trap 'rm -rf "$temp"' EXIT
+mkdir -p "$temp/bin"; export PATH="$temp/bin:$PATH" MOCK_TRACE="$temp/trace" DEPLOY_BUCKET=test-bucket CODEDEPLOY_APP=frontend-test CODEDEPLOY_GROUP=local-frontend GITHUB_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa GITHUB_RUN_ID=732 GITHUB_RUN_ATTEMPT=2
+printf 'test artifact' > "$temp/frontend.zip"
+cat > "$temp/bin/aws" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s %s\n' "$1" "$2" >> "$MOCK_TRACE"
+case "$1:$2" in
+  s3api:get-bucket-versioning) printf '%s\n' "${MOCK_VERSIONING:-Enabled}" ;;
+  s3api:put-object) [[ "$*" == *"--key frontend/$GITHUB_SHA/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.zip"* && "$*" == *'--if-none-match *'* ]]; printf '%s\n' "${MOCK_VERSION:-test.version}" ;;
+  deploy:create-deployment)
+    while [[ $# -gt 0 && $1 != --revision ]]; do shift; done
+    jq -e --arg bucket "$DEPLOY_BUCKET" --arg key "frontend/$GITHUB_SHA/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.zip" '.revisionType=="S3" and .s3Location=={bucket:$bucket,key:$key,bundleType:"zip",version:"test.version"}' <<< "$2" >/dev/null
+    printf 'd-ABC123\n' ;;
+  deploy:wait) [[ $3 == deployment-successful && $5 == d-ABC123 ]]; exit "${MOCK_WAIT:-0}" ;;
+  *) exit 12 ;;
+esac
+MOCK
+chmod +x "$temp/bin/aws"
+run() { : > "$MOCK_TRACE"; bash "$root/deploy/publish-frontend.sh" "$temp/frontend.zip"; }
+run; [[ $(wc -l < "$MOCK_TRACE") -eq 4 ]]
+if MOCK_VERSIONING=Suspended run; then exit 1; fi; [[ $(wc -l < "$MOCK_TRACE") -eq 1 ]]
+if MOCK_VERSION=None run; then exit 1; fi; [[ $(wc -l < "$MOCK_TRACE") -eq 2 ]]
+if MOCK_WAIT=4 run; then exit 1; fi
+# Build a tiny committed fixture; local settings and untracked hook files must not ship.
+r="$temp/fixture"; mkdir -p "$r/deploy/codedeploy" "$r/dist/assets"; cp "$root/deploy/package-frontend.sh" "$r/deploy/"
+for f in appspec.yml deploy/release.sh deploy/codedeploy/activate.sh; do printf 'fixture\n' > "$r/$f"; done
+(cd "$r"; git init -q; git add .; git -c user.name=fixture -c user.email=test@example.invalid -c commit.gpgsign=false commit -qm fixture)
+sha=$(git -C "$r" rev-parse HEAD); echo '<title>Mailhub</title><script src="/assets/app.js"></script>' > "$r/dist/index.html"; echo 'export{}' > "$r/dist/assets/app.js"; echo omit > "$r/.env"; echo omit > "$r/deploy/codedeploy/local-only"
+(cd "$r"; bash deploy/package-frontend.sh "$sha" "$temp/first.zip"; touch dist/index.html; bash deploy/package-frontend.sh "$sha" "$temp/second.zip")
+cmp "$temp/first.zip" "$temp/second.zip"; mkdir "$temp/unpacked"; unzip -qo "$temp/first.zip" -d "$temp/unpacked"; [[ $(cat "$temp/unpacked/revision.txt") == "$sha" ]]; [[ ! -e "$temp/unpacked/deploy/codedeploy/local-only" ]]; (cd "$temp/unpacked"; shasum -a 256 -c frontend.tar.gz.sha256; tar -tzf frontend.tar.gz > "$temp/list"); grep -qx 'assets/app.js' "$temp/list"; if grep -Eq '(^|/)(\.env|node_modules|\.git)(/|$)' "$temp/list"; then exit 1; fi
+if grep -Eq 'EC2_SSH_KEY|authorize-security-group-ingress|scp |ssh ' "$root/.github/workflows/deploy.yml"; then echo 'Unexpected SSH configuration' >&2; exit 1; fi
+printf 'PASS: deterministic allowlisted package, version-pinned S3 publish, guard conditions and CodeDeploy failure propagation\n'
