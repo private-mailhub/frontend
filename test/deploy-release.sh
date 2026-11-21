@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -eu
+# Do not include macOS resource-fork sidecar entries in Linux deployment fixtures.
+export COPYFILE_DISABLE=1
 
 assert_other_execute() {
   python3 - "$1" <<'PY'
@@ -168,9 +170,13 @@ assert_other_read "$deploy_root/shared/assets/new-asset.js" || {
   exit 1
 }
 
-if "$script" "$sha" "$test_root/frontend.tar.gz" >/dev/null 2>&1; then
-  printf 'FAIL: existing release was overwritten on repeat\n' >&2
-  exit 1
+inode_before=$(ls -di "$release" | awk '{print $1}')
+"$script" "$sha" "$test_root/frontend.tar.gz" >/dev/null
+[ "$(ls -di "$release" | awk '{print $1}')" = "$inode_before" ] || {
+  printf 'FAIL: identical redeployment replaced an immutable release\n' >&2; exit 1;
+}
+if "$script" "$sha" "$test_root/frontend-changed.tar.gz" >/dev/null 2>&1; then
+  printf 'FAIL: changed tree reused an existing SHA\n' >&2; exit 1
 fi
 
 next_sha=1234567890abcdef1234567890abcdef12345678
@@ -202,3 +208,4 @@ fi
 }
 
 printf 'PASS: frontend immutable release, atomic current link, required files, asset preservation, and PM2 isolation\n'
+bash "$repo_root/test/codedeploy-hooks.sh"
