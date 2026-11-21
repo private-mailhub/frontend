@@ -1,0 +1,12 @@
+version: 0.0
+os: linux
+# Hooks consume the agent's revision directory; Install must not copy over a live root.
+hooks:
+  AfterInstall:
+    - location: deploy/codedeploy/after-install.sh
+      timeout: 300
+      runas: ubuntu
+  ValidateService:
+    - location: deploy/codedeploy/validate-service.sh
+      timeout: 300
+      runas: ubuntu
