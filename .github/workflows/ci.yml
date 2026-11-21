@@ -50,3 +50,6 @@ jobs:
 
       - name: Check shared deployment foundation contracts offline
         run: ruby infra/codedeploy/test_foundation.rb
+
+      - name: Check optional host identity contract offline
+        run: ruby infra/codedeploy/host-identity/test_host_identity.rb
