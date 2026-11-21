@@ -35,11 +35,11 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Build
-        run: npm run build
-
       - name: Validate production build does not expose encryption keys
         run: bash test/production-build.sh
 
-      - name: Validate immutable release script
-        run: bash test/deploy-release.sh
+      - name: Build
+        run: npm run build
+
+      - name: Validate CodeDeploy package contract
+        run: bash test/package-frontend.sh
