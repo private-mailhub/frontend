@@ -1,0 +1,214 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Shared production EC2 CodeDeploy foundation. Creates no instances, network rules, or deployments.
+
+Parameters:
+  GitHubOidcProviderArn:
+    Type: String
+    Description: ARN of this account's EXISTING token.actions.githubusercontent.com provider (audience sts.amazonaws.com).
+    AllowedPattern: 'arn:aws:iam::[0-9]{12}:oidc-provider/token\.actions\.githubusercontent\.com'
+  HostTagKey:
+    Type: String
+    Description: Dedicated EC2 deployment-target tag key. Both groups target the same explicitly tagged host.
+    AllowedPattern: '(?![Aa][Ww][Ss]:)[A-Za-z0-9][A-Za-z0-9._:/+=@-]{0,127}'
+  HostTagValue:
+    Type: String
+    Description: Exact nonempty value of the target tag. Confirm only the intended host matches before deployment.
+    AllowedPattern: '[A-Za-z0-9][A-Za-z0-9._:/+=@-]{0,255}'
+  ExistingInstanceRoleName:
+    Type: String
+    Default: ''
+    AllowedPattern: '([A-Za-z0-9+=,.@_-]{1,64})?'
+    Description: Optional existing instance role NAME (not ARN, path, or profile name). Empty creates an unattached read policy.
+
+Rules:
+  ProductionRegion:
+    Assertions:
+      - Assert: {'Fn::Equals': [{Ref: 'AWS::Region'}, us-east-1]}
+        AssertDescription: This foundation can be created or updated only in us-east-1.
+Conditions:
+  AttachInstanceReadPolicy:
+    Fn::Not: [{'Fn::Equals': [{Ref: ExistingInstanceRoleName}, '']}]
+
+Resources:
+  Artifacts:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VersioningConfiguration: {Status: Enabled}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteUploadsOnly
+            Status: Enabled
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 7}
+  ArtifactTransportPolicy:
+    Type: AWS::S3::BucketPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Bucket: {Ref: Artifacts}
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - {'Fn::GetAtt': [Artifacts, Arn]}
+              - {'Fn::Sub': '${Artifacts.Arn}/*'}
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
+
+  # This is assumed BY CodeDeploy, not by EC2 or the GitHub jobs. No ASG, ELB or SNS features are used.
+  DiscoveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codedeploy.us-east-1.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DiscoverTaggedHosts
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['ec2:DescribeInstances', 'ec2:DescribeInstanceStatus', 'tag:GetResources']
+                Resource: '*'
+                Condition: {StringEquals: {'aws:RequestedRegion': us-east-1}}
+
+  # No profile is created/replaced. This adds only the rights needed to fetch artifact objects.
+  InstanceArtifactReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Read frontend and API revision objects on the shared deployment host.
+      Roles:
+        Fn::If: [AttachInstanceReadPolicy, [{Ref: ExistingInstanceRoleName}], {Ref: 'AWS::NoValue'}]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: ['s3:GetObject', 's3:GetObjectVersion']
+            Resource:
+              - {'Fn::Sub': '${Artifacts.Arn}/frontend/*'}
+              - {'Fn::Sub': '${Artifacts.Arn}/api/*'}
+
+  FrontendApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties: {ComputePlatform: Server}
+  FrontendDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: {Ref: FrontendApplication}
+      ServiceRoleArn: {'Fn::GetAtt': [DiscoveryRole, Arn]}
+      DeploymentConfigName: CodeDeployDefault.OneAtATime
+      DeploymentStyle: {DeploymentType: IN_PLACE, DeploymentOption: WITHOUT_TRAFFIC_CONTROL}
+      Ec2TagFilters:
+        - {Key: {Ref: HostTagKey}, Value: {Ref: HostTagValue}, Type: KEY_AND_VALUE}
+      OutdatedInstancesStrategy: IGNORE
+      AutoRollbackConfiguration: {Enabled: true, Events: [DEPLOYMENT_FAILURE]}
+  ApiApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties: {ComputePlatform: Server}
+  ApiDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: {Ref: ApiApplication}
+      ServiceRoleArn: {'Fn::GetAtt': [DiscoveryRole, Arn]}
+      DeploymentConfigName: CodeDeployDefault.OneAtATime
+      DeploymentStyle: {DeploymentType: IN_PLACE, DeploymentOption: WITHOUT_TRAFFIC_CONTROL}
+      Ec2TagFilters:
+        - {Key: {Ref: HostTagKey}, Value: {Ref: HostTagValue}, Type: KEY_AND_VALUE}
+      OutdatedInstancesStrategy: IGNORE
+      AutoRollbackConfiguration: {Enabled: true, Events: [DEPLOYMENT_FAILURE]}
+
+  # Keep exact resource types separate. GetDeployment takes an ID but is authorized on the group ARN.
+  FrontendReleaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Federated: {Ref: GitHubOidcProviderArn}}
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+                'token.actions.githubusercontent.com:sub': 'repo:private-mailhub/frontend:environment:production'
+      Policies:
+        - PolicyName: PublishFrontendRevision
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetBucketVersioning
+                Resource: {'Fn::GetAtt': [Artifacts, Arn]}
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: {'Fn::Sub': '${Artifacts.Arn}/frontend/*'}
+              - Effect: Allow
+                Action: ['codedeploy:CreateDeployment', 'codedeploy:GetDeployment']
+                Resource: {'Fn::Sub': 'arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${FrontendApplication}/${FrontendDeploymentGroup}'}
+              - Effect: Allow
+                Action: ['codedeploy:GetApplicationRevision', 'codedeploy:RegisterApplicationRevision']
+                Resource: {'Fn::Sub': 'arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:application:${FrontendApplication}'}
+              - Effect: Allow
+                Action: codedeploy:GetDeploymentConfig
+                Resource: {'Fn::Sub': 'arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentconfig:CodeDeployDefault.OneAtATime'}
+  ApiReleaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Federated: {Ref: GitHubOidcProviderArn}}
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+                'token.actions.githubusercontent.com:sub': 'repo:private-mailhub/backend:environment:production'
+      Policies:
+        - PolicyName: PublishApiRevision
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetBucketVersioning
+                Resource: {'Fn::GetAtt': [Artifacts, Arn]}
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: {'Fn::Sub': '${Artifacts.Arn}/api/*'}
+              - Effect: Allow
+                Action: ['codedeploy:CreateDeployment', 'codedeploy:GetDeployment']
+                Resource: {'Fn::Sub': 'arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${ApiApplication}/${ApiDeploymentGroup}'}
+              - Effect: Allow
+                Action: ['codedeploy:GetApplicationRevision', 'codedeploy:RegisterApplicationRevision']
+                Resource: {'Fn::Sub': 'arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:application:${ApiApplication}'}
+              - Effect: Allow
+                Action: codedeploy:GetDeploymentConfig
+                Resource: {'Fn::Sub': 'arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentconfig:CodeDeployDefault.OneAtATime'}
+
+Outputs:
+  Region: {Value: {Ref: 'AWS::Region'}}
+  DeployBucket: {Value: {Ref: Artifacts}}
+  FrontendRoleArn: {Value: {'Fn::GetAtt': [FrontendReleaseRole, Arn]}}
+  FrontendApp: {Value: {Ref: FrontendApplication}}
+  FrontendGroup: {Value: {Ref: FrontendDeploymentGroup}}
+  ApiRoleArn: {Value: {'Fn::GetAtt': [ApiReleaseRole, Arn]}}
+  ApiApp: {Value: {Ref: ApiApplication}}
+  ApiGroup: {Value: {Ref: ApiDeploymentGroup}}
+  InstanceReadPolicyArn: {Value: {Ref: InstanceArtifactReadPolicy}}
