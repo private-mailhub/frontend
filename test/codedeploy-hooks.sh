@@ -4,7 +4,7 @@ set -Eeuo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd -P)
 work=$(mktemp -d)
 server=''
-cleanup() { if [[ -n $server ]]; then kill "$server" 2>/dev/null || :; wait "$server" 2>/dev/null || :; fi; rm -rf "$work"; }
+cleanup() { local rc=$?; if [[ $rc != 0 && -s $work/server.log ]]; then cat "$work/server.log" >&2; fi; if [[ -n $server ]]; then kill "$server" 2>/dev/null || :; wait "$server" 2>/dev/null || :; fi; rm -rf "$work"; }
 trap cleanup EXIT
 export MAILHUB_DEPLOY_ROOT="$work/frontend" MAILHUB_DEPLOY_LOCK="$work/deploy.lock" TEST_FIXTURE="$work"
 export REAL_CURL
@@ -65,7 +65,11 @@ class Stub(http.server.BaseHTTPRequestHandler):
         media = 'text/html; charset=utf-8' if self.path == '/' else 'text/javascript'
         if (w/'bad-mime').exists() and (w/'bad-mime').read_text().strip() == active + ' ' + self.path:
             media = 'text/plain'
-        self.send_response(200); self.send_header('Content-Type', media); self.end_headers(); self.wfile.write(body)
+        self.send_response(200)
+        self.send_header('Content-Type', media)
+        # Frame the body: TLS close_notify is not guaranteed by the disposable server.
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers(); self.wfile.write(body)
     def log_message(self, *args): pass
 srv = http.server.HTTPServer(('127.0.0.1', 0), Stub)
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(w/'cert', w/'key')
