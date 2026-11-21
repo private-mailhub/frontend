@@ -1,22 +1,48 @@
-name: Deploy frontend
-
+name: Deploy frontend only
 on:
   workflow_dispatch:
-
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'infra/**']
 permissions:
   contents: read
-  id-token: write
-
 concurrency:
-  group: mailhub-frontend-deploy
+  group: mailhub-frontend-production
   cancel-in-progress: false
-
 jobs:
-  deploy:
-    # Deployment is intentionally manual and disabled until this repository variable is set.
-    if: ${{ github.ref == 'refs/heads/main' && vars.CODEDEPLOY_ENABLED == 'true' }}
-    environment: production
+  build:
+    if: github.ref == 'refs/heads/main' && vars.CODEDEPLOY_ENABLED == 'true' && (github.event_name == 'workflow_dispatch' || vars.CODEDEPLOY_AUTO_ENABLED == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci --engine-strict
+      - run: npm run lint && npm run typecheck
+      - run: bash test/production-build.sh
+      - run: VITE_API_URL=https://private-mailhub.com npm run build:prod
+      - run: bash test/deploy-release.sh && bash test/package-frontend.sh
+      - name: Package only the verified frontend and hooks
+        run: bash deploy/package-frontend.sh "$GITHUB_SHA" "$RUNNER_TEMP/frontend.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-${{ github.sha }}
+          path: ${{ runner.temp }}/frontend.zip
+          if-no-files-found: error
+          retention-days: 7
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
       AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
@@ -24,90 +50,37 @@ jobs:
       CODEDEPLOY_APP: ${{ vars.CODEDEPLOY_APP }}
       CODEDEPLOY_GROUP: ${{ vars.CODEDEPLOY_GROUP }}
     steps:
-      - name: Checkout requested revision
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
-
-      - name: Validate deployment configuration
-        run: |
-          set -Eeuo pipefail
-          : "${AWS_REGION:?AWS_REGION is required}"
-          : "${AWS_ROLE_ARN:?AWS_ROLE_ARN is required}"
-          : "${DEPLOY_BUCKET:?DEPLOY_BUCKET is required}"
-          : "${CODEDEPLOY_APP:?CODEDEPLOY_APP is required}"
-          : "${CODEDEPLOY_GROUP:?CODEDEPLOY_GROUP is required}"
-          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
         with:
-          node-version-file: .nvmrc
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci --engine-strict
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Validate production build does not expose encryption keys
-        run: bash test/production-build.sh
-
-      - name: Build production frontend
-        run: VITE_API_URL=https://private-mailhub.com npm run build:prod
-
-      - name: Package CodeDeploy revision
+          name: frontend-${{ github.sha }}
+          path: ${{ runner.temp }}/frontend-revision
+      - name: Validate target and artifact
         run: |
-          set -Eeuo pipefail
-          bundle="$RUNNER_TEMP/mailhub-frontend-${GITHUB_SHA}.zip"
-          deploy/package-frontend.sh "$GITHUB_SHA" "$bundle"
-          printf 'REVISION_BUNDLE=%s\n' "$bundle" >> "$GITHUB_ENV"
-
-      - name: Configure AWS credentials with OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+          set -euo pipefail
+          : "${AWS_REGION:?}" "${AWS_ROLE_ARN:?}" "${DEPLOY_BUCKET:?}" "${CODEDEPLOY_APP:?}" "${CODEDEPLOY_GROUP:?}"
+          test "$AWS_REGION" = us-east-1
+          archive="$RUNNER_TEMP/frontend-revision/frontend.zip"
+          unzip -tq "$archive"
+          test "$(unzip -p "$archive" revision.txt)" = "$GITHUB_SHA"
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ env.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Upload immutable revision to S3
-        id: upload
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: mailhub-frontend-${{ github.run_id }}
+      - name: Publish versioned revision and wait for CodeDeploy
+        run: bash deploy/publish-frontend.sh "$RUNNER_TEMP/frontend-revision/frontend.zip"
+      - name: Check the public homepage after CodeDeploy
         run: |
-          set -Eeuo pipefail
-          revision_key="frontend/${GITHUB_SHA}/mailhub-frontend-${GITHUB_SHA}.zip"
-          version_id="$(aws s3api put-object \
-            --bucket "$DEPLOY_BUCKET" \
-            --key "$revision_key" \
-            --body "$REVISION_BUNDLE" \
-            --query VersionId \
-            --output text)"
-          [[ -n "$version_id" && "$version_id" != 'None' ]]
-          printf 'key=%s\n' "$revision_key" >> "$GITHUB_OUTPUT"
-          printf 'version_id=%s\n' "$version_id" >> "$GITHUB_OUTPUT"
-
-      - name: Create CodeDeploy deployment
-        id: deployment
-        env:
-          REVISION_KEY: ${{ steps.upload.outputs.key }}
-          REVISION_VERSION: ${{ steps.upload.outputs.version_id }}
-        run: |
-          set -Eeuo pipefail
-          deployment_id="$(aws deploy create-deployment \
-            --application-name "$CODEDEPLOY_APP" \
-            --deployment-group-name "$CODEDEPLOY_GROUP" \
-            --s3-location "bucket=$DEPLOY_BUCKET,key=$REVISION_KEY,bundleType=zip,version=$REVISION_VERSION" \
-            --query deploymentId \
-            --output text)"
-          [[ -n "$deployment_id" && "$deployment_id" != 'None' ]]
-          printf 'id=%s\n' "$deployment_id" >> "$GITHUB_OUTPUT"
-
-      - name: Wait for CodeDeploy success
-        env:
-          DEPLOYMENT_ID: ${{ steps.deployment.outputs.id }}
-        run: aws deploy wait deployment-successful --deployment-id "$DEPLOYMENT_ID"
-
-      - name: Verify HTTPS homepage
-        run: curl --fail --silent --show-error --retry 5 --retry-all-errors https://private-mailhub.com/
+          set -euo pipefail
+          page="$RUNNER_TEMP/mailhub-home.html"
+          curl --proto '=https' --fail --silent --show-error --location --max-redirs 2 --max-time 15 --retry 2 https://private-mailhub.com/ -o "$page"
+          grep -qi '<title>Mailhub</title>' "$page"
+          unzip -p "$RUNNER_TEMP/frontend-revision/frontend.zip" frontend.tar.gz > "$RUNNER_TEMP/published-fe.tgz"
+          tar -xzOf "$RUNNER_TEMP/published-fe.tgz" index.html | cmp - "$page"
+          file=$(grep -Eo '/assets/[-a-zA-Z0-9._]+\.js' "$page" | head -n 1)
+          test -n "$file"
+          curl --proto '=https' --fail --silent --show-error --max-time 15 "https://private-mailhub.com$file" -o "$RUNNER_TEMP/live-entry.js" -w '%{content_type}' | grep -Eiq 'javascript|ecmascript'
+          tar -xzOf "$RUNNER_TEMP/published-fe.tgz" "${file#/}" | cmp - "$RUNNER_TEMP/live-entry.js"

@@ -39,7 +39,14 @@ jobs:
         run: bash test/production-build.sh
 
       - name: Build
-        run: npm run build
+        run: VITE_API_URL=https://private-mailhub.com npm run build:prod
 
       - name: Validate CodeDeploy package contract
-        run: bash test/package-frontend.sh
+        run: |
+          bash test/deploy-release.sh
+          bash test/package-frontend.sh
+          bash deploy/package-frontend.sh "$GITHUB_SHA" "$RUNNER_TEMP/frontend-ci.zip"
+          unzip -tq "$RUNNER_TEMP/frontend-ci.zip"
+
+      - name: Check shared deployment foundation contracts offline
+        run: ruby infra/codedeploy/test_foundation.rb

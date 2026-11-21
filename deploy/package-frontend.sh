@@ -1,57 +1,25 @@
 #!/usr/bin/env bash
-# Create the CodeDeploy revision from an already-built frontend dist directory.
-set -Eeuo pipefail
-
-usage() {
-  printf 'Usage: %s <40-character-lowercase-sha> <output-bundle.zip>\n' "$0" >&2
-}
-
-fail() {
-  printf 'ERROR: %s\n' "$*" >&2
-  exit 1
-}
-
-if [[ $# -ne 2 ]]; then
-  usage
-  exit 64
-fi
-
-release_sha="$1"
-output_bundle="$2"
-if [[ ! "$release_sha" =~ ^[0-9a-f]{40}$ ]]; then
-  fail 'release SHA must be exactly 40 lowercase hexadecimal characters'
-fi
-
-repo_root=$(cd "$(dirname "$0")/.." && pwd)
-dist_dir="$repo_root/dist"
-appspec="$repo_root/appspec.yml"
-release_script="$repo_root/deploy/release.sh"
-hooks_dir="$repo_root/deploy/codedeploy"
-output_dir=$(cd "$(dirname "$output_bundle")" && pwd)
-output_bundle="$output_dir/$(basename "$output_bundle")"
-[[ ! -L "$output_bundle" ]] || fail "output bundle path must not be a symbolic link: $output_bundle"
-
-for required_path in "$dist_dir/index.html" "$appspec" "$release_script" "$hooks_dir"; do
-  [[ -e "$required_path" && ! -L "$required_path" ]] || fail "required package input is missing or a symbolic link: $required_path"
-done
-[[ -d "$hooks_dir" ]] || fail "CodeDeploy hooks path must be a directory"
-[[ -x "$release_script" ]] || fail "deploy/release.sh must be executable"
-
-staging_dir=$(mktemp -d "${TMPDIR:-/tmp}/mailhub-frontend-package.XXXXXX")
-trap 'rm -rf "$staging_dir"' EXIT
-
-install -m 0644 "$appspec" "$staging_dir/appspec.yml"
-mkdir -p "$staging_dir/deploy"
-install -m 0755 "$release_script" "$staging_dir/deploy/release.sh"
-cp -R "$hooks_dir" "$staging_dir/deploy/codedeploy"
-printf '%s\n' "$release_sha" > "$staging_dir/revision.txt"
-
-tar -czf "$staging_dir/frontend.tar.gz" -C "$dist_dir" .
-(
-  cd "$staging_dir"
-  sha256sum frontend.tar.gz > frontend.tar.gz.sha256
-  zip -q -r "$staging_dir/revision.zip" appspec.yml deploy revision.txt frontend.tar.gz frontend.tar.gz.sha256
-)
-mv -f "$staging_dir/revision.zip" "$output_bundle"
-
-printf '%s\n' "$output_bundle"
+# Produce only compiled frontend files and reviewed CodeDeploy hooks, never the checkout or .env.
+set -euo pipefail
+umask 022
+[[ $# == 2 && $1 =~ ^[0-9a-f]{40}$ ]] || { echo 'usage: package-frontend.sh <git-sha> <new-zip-path>' >&2; exit 2; }
+sha=$1
+out="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
+[[ ! -e "$out" && ! -L "$out" ]] || { echo 'output must be a new file' >&2; exit 1; }
+cd "$(dirname "$0")/.."
+[[ $(git rev-parse HEAD) == "$sha" ]] || { echo 'checkout/revision mismatch' >&2; exit 1; }
+[[ -s dist/index.html && -d dist/assets && -s appspec.yml && -d deploy/codedeploy && -z $(find dist ! -type d ! -type f -print -quit) ]] || { echo 'missing production dist or unsafe content' >&2; exit 1; }
+[[ -z $(find dist \( -name .git -o -name .DS_Store -o -name ".env*" -o -name "*.pem" -o -name node_modules \) -print -quit) ]] || { echo 'unexpected private/build input' >&2; exit 1; }
+stage=$(mktemp -d); trap 'rm -rf "$stage"' EXIT
+mkdir -p "$stage/content" "$stage/bundle/deploy"
+# Hooks and manifests come from the Git object, not untracked operator files.
+git archive "$sha" appspec.yml deploy/release.sh deploy/codedeploy | tar -x -C "$stage/bundle"
+cp -R dist/. "$stage/content/"
+[[ -z $(find "$stage/content" "$stage/bundle" ! -type f ! -type d -print -quit) ]] || { echo 'non-regular archive content' >&2; exit 1; }
+# Normalize copied timestamps and ordering so rebuilding unchanged files yields the same payload.
+export LC_ALL=C TZ=UTC COPYFILE_DISABLE=1
+(cd "$stage/content"; find . -mindepth 1 -exec touch -t 200001010000.00 {} +; find . -mindepth 1 -print | sed 's@^\./@@' | sort > "$stage/names"; if tar --version | grep -q 'GNU tar'; then tar --format=ustar --owner=0 --group=0 --numeric-owner --no-recursion -cf - -T "$stage/names"; else tar --format=ustar --uid 0 --gid 0 --uname root --gname root --no-recursion -cf - -T "$stage/names"; fi) | gzip -n > "$stage/bundle/frontend.tar.gz"
+cd "$stage/bundle"; printf '%s\n' "$sha" > revision.txt
+if command -v sha256sum >/dev/null; then sha256sum frontend.tar.gz; else shasum -a 256 frontend.tar.gz; fi > frontend.tar.gz.sha256
+find . -type f -exec touch -t 200001010000.00 {} +
+find . -type f -print | sed 's@^\./@@' | sort | zip -Xq "$out" -@
