@@ -2,11 +2,17 @@
 # Local template contract tests. No AWS SDK, credentials, network, or filesystem writes.
 require 'yaml'
 require 'minitest/autorun'
+require_relative 'verify_oidc'
 
 class FoundationTest < Minitest::Test
   TEMPLATE = YAML.safe_load(File.read(File.join(__dir__, 'foundation.yaml')))
   RES = TEMPLATE.fetch('Resources')
   SERVICES = { 'Frontend' => %w[frontend frontend], 'Api' => %w[backend api] }.freeze
+  # Public repository identity metadata, independent of the template under test.
+  ISSUER_PREFIX = {
+    'frontend' => 'repo:private-mailhub@301659027/frontend@1359848410',
+    'backend' => 'repo:private-mailhub@301659027/backend@1126574189'
+  }.freeze
   REGION = 'us-east-1'
   CONFIG = 'CodeDeployDefault.OneAtATime'
   CD = 'arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:'
@@ -78,10 +84,34 @@ class FoundationTest < Minitest::Test
       role = props("#{s}ReleaseRole")
       assert_equal %w[AssumeRolePolicyDocument Policies], role.keys.sort
       claims = { 'token.actions.githubusercontent.com:aud' => 'sts.amazonaws.com',
-                 'token.actions.githubusercontent.com:sub' => "repo:private-mailhub/#{repo}:environment:production" }
+                 'token.actions.githubusercontent.com:sub' => "#{ISSUER_PREFIX.fetch(repo)}:environment:production" }
       assert_equal [{ 'Effect' => 'Allow', 'Principal' => { 'Federated' => ref('GitHubOidcProviderArn') },
                       'Action' => 'sts:AssumeRoleWithWebIdentity', 'Condition' => { 'StringEquals' => claims } }],
                    role.fetch('AssumeRolePolicyDocument').fetch('Statement')
+    end
+  end
+
+  def test_operator_preflight_compares_live_metadata_without_trusting_names_or_wildcards
+    ISSUER_PREFIX.each do |repo, prefix|
+      cfg = { 'use_default' => true, 'use_immutable_subject' => true, 'sub_claim_prefix' => prefix }
+      assert_nil ReleaseOidc.verify!(repo, cfg, RES)
+      [{ 'use_default' => false }, { 'use_immutable_subject' => false },
+       { 'sub_claim_prefix' => prefix.sub('@301659027/', '@123/') },
+       { 'sub_claim_prefix' => prefix.sub(/@[0-9]+\z/, '@999') },
+       { 'sub_claim_prefix' => "repo:private-mailhub/#{repo}" },
+       { 'sub_claim_prefix' => ISSUER_PREFIX.values.find { |other| other != prefix } },
+       { 'sub_claim_prefix' => nil }].each do |change|
+        assert_raises(RuntimeError) { ReleaseOidc.verify!(repo, cfg.merge(change), RES) }
+      end
+    end
+    role = 'FrontendReleaseRole'
+    cfg = { 'use_default' => true, 'use_immutable_subject' => true, 'sub_claim_prefix' => ISSUER_PREFIX.fetch('frontend') }
+    { 'token.actions.githubusercontent.com:aud' => '*',
+      'token.actions.githubusercontent.com:sub' => "#{cfg['sub_claim_prefix']}:environment:staging" }.each do |key, bad|
+      modified = JSON.parse(JSON.generate(RES))
+      statement = modified.dig(role, 'Properties', 'AssumeRolePolicyDocument', 'Statement').first
+      statement.fetch('Condition').fetch('StringEquals')[key] = bad
+      assert_raises(RuntimeError) { ReleaseOidc.verify!('frontend', cfg, modified) }
     end
   end
 
